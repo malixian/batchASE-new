@@ -59,6 +59,7 @@ class Worker:
         bfgs_cpu_thread: int = 1,
         worker_id: int = 0,
         compile_mode: Optional[str] = None,
+        neighbor: str = "auto",
         batch_mode: str = "bsize",
         structure_order: str = "rand",
         structure_order_seed: int = 42,
@@ -115,6 +116,7 @@ class Worker:
         self.cueq = cueq
         self.bfgs_cpu_thread = bfgs_cpu_thread
         self.compile_mode = compile_mode or kwargs.get("compile_mode", None)
+        self.neighbor = neighbor
         self.f_upper_limit = float(kwargs.get("f_upper_limit", 100.0))
         self.stage2_include_unconverged = bool(kwargs.get("stage2_include_unconverged", False))
         self.use_profiler = kwargs.get("use_profiler", False)
@@ -806,9 +808,13 @@ class Worker:
             return
 
         a2g = AtomsToGraphs(r_edges=False, r_pbc=True, dtype=torch.float64)
+        backend_kwargs = {}
+        if self.model.split(":", 1)[0].lower() in ("mace", "mace_mp", "mace_off"):
+            backend_kwargs["neighbor"] = self.neighbor
         backend = create_backend(
             self.model, device=self.device, enable_cueq=self.cueq,
             use_fasteq=self.use_fasteq, compile_mode=self.compile_mode,
+            **backend_kwargs,
         )
         worker_start = time.perf_counter()
         stages = {}

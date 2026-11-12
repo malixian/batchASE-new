@@ -37,15 +37,9 @@ def detect_optimal_backend() -> str:
     except Exception:
         pass
 
-    # 3. Check Triton
-    try:
-        from .triton import is_triton_available
-        if is_triton_available():
-            return "triton"
-    except Exception:
-        pass
-
-    # 4. Fallback to CPU PyTorch
+    # The Triton radius graph is currently a placeholder, so auto dispatch must
+    # not select it merely because the Triton runtime is installed.
+    # 3. Fallback to the pure PyTorch implementation (also runs on GPU tensors).
     return "cpu"
 
 

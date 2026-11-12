@@ -2,7 +2,7 @@
 
 Verifies:
 1. create_backend("mace") creates a functional MACEBatchBackend.
-2. create_backend() on unimplemented placeholder backends (sevennet, chgnet, matris, matgl)
+2. create_backend() on unimplemented placeholder backends (sevennet, matgl)
    immediately raises NotImplementedError with clear guidance.
 3. create_backend() on unknown backend raises ValueError.
 4. Direct instantiation of stub classes raises NotImplementedError.
@@ -30,6 +30,7 @@ from batchase.potentials import (
     SevenNetBatchBackend,
     CHGNetBatchBackend,
     MatRISBatchBackend,
+    EqV3BatchBackend,
 )
 
 
@@ -55,7 +56,7 @@ class TestBackendRegistry(unittest.TestCase):
 
     def test_unimplemented_backends_fail_fast(self):
         """create_backend on placeholder backends immediately raises NotImplementedError."""
-        for name in ("sevennet", "chgnet", "matris", "matgl"):
+        for name in ("sevennet", "matgl"):
             with self.subTest(backend=name):
                 with self.assertRaises(NotImplementedError) as ctx:
                     create_backend(name)
@@ -74,10 +75,6 @@ class TestBackendRegistry(unittest.TestCase):
         """Direct instantiation of placeholder classes raises NotImplementedError."""
         with self.assertRaises(NotImplementedError):
             SevenNetBatchBackend()
-        with self.assertRaises(NotImplementedError):
-            CHGNetBatchBackend()
-        with self.assertRaises(NotImplementedError):
-            MatRISBatchBackend()
 
 
 class TestParseModelId(unittest.TestCase):
@@ -217,6 +214,90 @@ class TestLoaderRouting(unittest.TestCase):
         backend = create_backend("mace_mp:mace-mpa-0-medium.model", calculator=calc, device="cpu")
         self.assertIs(backend.calculator, calc)
         self.assertEqual(backend.loader_hint, "mp")
+
+
+class MockMatRISModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.anchor = torch.nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
+        self.config = {"pairwise_cutoff": 6.0, "three_body_cutoff": 4.0}
+        self.is_intensive = True
+        self.calls = []
+
+    def forward(self, graphs, task, **kwargs):
+        self.calls.append((task, kwargs))
+        prediction = {
+            "e": torch.tensor([2.0, 3.0], dtype=torch.float32),
+            "atoms_per_graph": torch.tensor([2, 1], dtype=torch.int32),
+            "f": [
+                torch.arange(6, dtype=torch.float32).reshape(2, 3),
+                torch.arange(3, dtype=torch.float32).reshape(1, 3),
+            ],
+        }
+        if "s" in task:
+            prediction["s"] = [
+                torch.eye(3, dtype=torch.float32) * 160.21766208,
+                torch.eye(3, dtype=torch.float32) * 320.43532416,
+            ]
+        return prediction
+
+
+class TestMatRISBackend(unittest.TestCase):
+    def setUp(self):
+        self.model = MockMatRISModel()
+        self.backend = create_backend(
+            "matris",
+            model=self.model,
+            device="cpu",
+            mode="torch",
+            enable_cueq=True,
+            use_fasteq=True,
+            compile_mode=None,
+        )
+        self.inputs = {
+            "graphs": [object(), object()],
+            "pbc": torch.tensor([[True, True, True], [False, False, False]]),
+        }
+
+    def test_factory_and_standardized_outputs(self):
+        self.assertIsInstance(self.backend, MatRISBatchBackend)
+        self.assertEqual(self.backend.kind, "matris")
+        self.assertEqual(self.backend.r_max, 6.0)
+        results = self.backend._forward(self.inputs, compute_stress=True)
+        self.assertEqual(self.model.calls[-1][0], "efs")
+        self.assertEqual(results["energy"].shape, (2, 1))
+        self.assertEqual(results["forces"].shape, (3, 3))
+        self.assertEqual(results["stress"].shape, (2, 3, 3))
+        for value in results.values():
+            self.assertEqual(value.dtype, torch.float64)
+        torch.testing.assert_close(
+            results["energy"], torch.tensor([[4.0], [3.0]], dtype=torch.float64)
+        )
+        torch.testing.assert_close(
+            results["stress"][0],
+            torch.eye(3, dtype=torch.float64),
+            rtol=1e-5,
+            atol=1e-5,
+        )
+        torch.testing.assert_close(
+            results["stress"][1], torch.zeros((3, 3), dtype=torch.float64)
+        )
+
+    def test_force_only_prediction_omits_stress(self):
+        results = self.backend._forward(self.inputs, compute_stress=False)
+        self.assertEqual(self.model.calls[-1][0], "ef")
+        self.assertNotIn("stress", results)
+
+    def test_matris_model_validation(self):
+        self.assertIsNone(validate_model_id("matris"))
+        self.assertIsNone(validate_model_id("matris:matris_4m_matpes_pbev2"))
+        self.assertIsNone(validate_model_id("matris:https://example.com/model.pth.tar"))
+        with tempfile.TemporaryDirectory() as tmp:
+            ckpt = Path(tmp) / "model.pth.tar"
+            ckpt.write_bytes(b"checkpoint")
+            self.assertEqual(validate_model_id(f"matris:{ckpt}"), ckpt)
+        with self.assertRaises(FileNotFoundError):
+            validate_model_id("matris:definitely-missing-model.pth.tar")
 
 
 if __name__ == "__main__":

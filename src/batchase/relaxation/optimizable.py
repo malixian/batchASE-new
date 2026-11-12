@@ -9,6 +9,7 @@ Code based on ase.optimize
 
 from __future__ import annotations
 
+from pathlib import Path
 from functools import cached_property
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, ClassVar, Any, Generator
@@ -20,7 +21,6 @@ from ase.stress import voigt_6_to_full_3x3_stress
 
 
 from .ase_utils import batch_to_atoms
-from .status import SlotStatus, FailReason
 from itertools import product
 
 from ..potentials.base import BatchPotential
@@ -130,6 +130,34 @@ def compare_batches(
     return system_changes
 
 
+def load_matris_calculator(
+    model: str | Path = "matris_4m_matpes_pbev2",
+    device: str = "cuda",
+    **kwargs: Any,
+):
+    """Load MatRIS from the local checkpoint or the official model resolver.
+
+    For the default model, prefer /batchase/models/MatRIS_4M_MatPES_PBEv2.pth.tar.
+    If absent, pass the model key to MatRIS (official cache/download behavior).
+    Explicit checkpoint paths must exist. Use mode="torch" for eager execution.
+    """
+    model = str(model)
+    if model == "matris_4m_matpes_pbev2":
+        local = Path("/batchase/models/MatRIS_4M_MatPES_PBEv2.pth.tar")
+        if local.is_file():
+            model = str(local)
+    else:
+        checkpoint = Path(model).expanduser()
+        if not checkpoint.is_file():
+            raise FileNotFoundError(f"MatRIS checkpoint does not exist: {checkpoint}")
+        model = str(checkpoint)
+
+    from matris.applications.base import MatRISCalculator
+
+    kwargs.setdefault("task", "efs")
+    return MatRISCalculator(model=model, device=device, **kwargs)
+
+
 class OptimizableBatch(Optimizable):
     """A Batch version of ase Optimizable Atoms
 
@@ -155,7 +183,7 @@ class OptimizableBatch(Optimizable):
 
         Args:
             batch: A batch of atoms graph data
-            trainer: 旧接口，An instance of a BaseTrainer derived class（无 backend 时使用）
+            trainer: calculator 或 "matris_4m_matpes_pbev2" / MatRIS 权重路径（无 backend 时使用）
             backend: v0.5.0 起推荐的 BatchPotential 适配器（MACE 批处理路径）
             transform: graph transform
             mask_converged: if true will mask systems in batch that are already converged
@@ -167,6 +195,10 @@ class OptimizableBatch(Optimizable):
         """
         if trainer is None and backend is None:
             raise ValueError("OptimizableBatch 必须提供 trainer 或 backend 之一")
+        if backend is None and isinstance(trainer, (str, Path)):
+            trainer = load_matris_calculator(
+                model=trainer, device=str(batch.pos.device)
+            )
         self.backend = backend
         self.trainer = trainer
         self._calc_device = (
@@ -182,12 +214,6 @@ class OptimizableBatch(Optimizable):
         self.results = {}
         self._eps = masked_eps
         self.dtype = dtype
-
-        batch_count = getattr(self.batch, "num_graphs", None)
-        if batch_count is None:
-            batch_count = len(self.batch) if hasattr(self.batch, "__len__") else 1
-        self._slot_status = [SlotStatus.ACTIVE] * batch_count
-        self._slot_reasons: dict[int, str] = {}
 
         self.otf_graph = True  # trainer._unwrapped_model.otf_graph
         if not self.otf_graph and "edge_index" not in self.batch:
@@ -228,6 +254,11 @@ class OptimizableBatch(Optimizable):
         ]:
             return "sevennet"
         elif (
+            "matris" in trainer_module.lower()
+            or trainer_class_name == "MatRISCalculator"
+        ):
+            return "matris"
+        elif (
             "fairchem" in trainer_module.lower()
             or trainer_class_name == "FAIRChemCalculator"
         ):
@@ -245,62 +276,20 @@ class OptimizableBatch(Optimizable):
         return self.batch.batch
 
     @property
-    def slot_status(self) -> list[SlotStatus]:
-        return self._slot_status
-
-    @property
-    def failed_reasons(self) -> dict[int, str]:
-        return self._slot_reasons
-
-    @property
-    def active_indices_list(self) -> list[int]:
-        return [i for i, s in enumerate(self._slot_status) if s == SlotStatus.ACTIVE]
-
-    @property
-    def converge_indices_list(self) -> list[int]:
-        return [i for i, s in enumerate(self._slot_status) if s == SlotStatus.CONVERGED]
-
-    @property
-    def failed_indices_list(self) -> list[int]:
-        return [i for i, s in enumerate(self._slot_status) if s == SlotStatus.FAILED]
-
-    @property
-    def finished_indices_list(self) -> list[int]:
-        return [i for i, s in enumerate(self._slot_status) if s != SlotStatus.ACTIVE]
-
-    @property
     def converged_mask(self):
-        return torch.tensor(
-            [s == SlotStatus.CONVERGED for s in self._slot_status],
-            device=self.device,
-            dtype=torch.bool,
-        )
-
-    @property
-    def failed_mask(self):
-        return torch.tensor(
-            [s == SlotStatus.FAILED for s in self._slot_status],
-            device=self.device,
-            dtype=torch.bool,
-        )
+        if self._update_mask is not None:
+            return torch.logical_not(self._update_mask)
+        return None
 
     @property
     def update_mask(self):
         if self._update_mask is None:
-            self._update_mask = torch.tensor(
-                [s == SlotStatus.ACTIVE for s in self._slot_status],
-                device=self.device,
-                dtype=torch.bool,
-            )
+            return torch.ones(len(self.batch), dtype=bool)
         return self._update_mask
 
-    def mark_failed(self, slot_idx: int, reason: str) -> None:
-        """Explicitly mark a slot as failed with a given reason."""
-        if 0 <= slot_idx < len(self._slot_status):
-            self._slot_status[slot_idx] = SlotStatus.FAILED
-            self._slot_reasons[slot_idx] = reason
-            if self._update_mask is not None:
-                self._update_mask[slot_idx] = False
+    @property
+    def converge_indices_list(self):
+        return torch.where(~self.update_mask)[0].tolist()
 
     @property
     def elem_per_group(self):
@@ -322,6 +311,38 @@ class OptimizableBatch(Optimizable):
             excluded_properties=set(self.ignored_changes),
         )
 
+    def _predict_matris(self) -> dict[str, torch.Tensor]:
+        """Evaluate structures through the official ASE interface, sequentially.
+
+        ASE returns total energy (eV), forces (eV/Angstrom), and stress
+        (eV/Angstrom^3, ASE sign). No per-atom energy or stress conversion.
+        """
+        atoms_list = batch_to_atoms(
+            self.batch, results=None, wrap_pos=False, eps=1e-17
+        )
+        energies, forces, stresses = [], [], []
+        for atoms in atoms_list:
+            atoms.calc = self.trainer
+            energies.append(torch.as_tensor(
+                atoms.get_potential_energy(), device=self.device, dtype=self.dtype
+            ).reshape(()))
+            forces.append(torch.as_tensor(
+                atoms.get_forces(apply_constraint=False),
+                device=self.device, dtype=self.dtype,
+            ).reshape(-1, 3))
+            if self.compute_stress:
+                stresses.append(torch.as_tensor(
+                    atoms.get_stress(voigt=False, apply_constraint=False),
+                    device=self.device, dtype=self.dtype,
+                ).reshape(3, 3))
+        results = {
+            "energy": torch.stack(energies).detach(),
+            "forces": torch.cat(forces, dim=0).detach(),
+        }
+        if self.compute_stress:
+            results["stress"] = torch.stack(stresses).detach()
+        return results
+
     def _predict(self) -> None:
         """Run prediction if batch has any changes."""
         system_changes = self.check_state(self.batch)
@@ -337,6 +358,8 @@ class OptimizableBatch(Optimizable):
                 raise RuntimeError(
                     "MACE 后端必须通过 backend= 传入（统一走 batchase.potentials 适配层）。"
                 )
+            elif self._calculator_type == "matris":
+                self.torch_results = self._predict_matris()
             elif self._calculator_type == "fairchem":
                 # TODO: FAIRChemCalculator does not support batch prediction yet
                 atoms_list = batch_to_atoms(
@@ -473,23 +496,6 @@ class OptimizableBatch(Optimizable):
             return energies.view(-1)
         return energies
 
-    def get_internal_energies(self) -> torch.Tensor | NDArray:
-        """Get internal potential energy E for each system in batch (excluding PV term)."""
-        return self.get_potential_energies()
-
-    def get_pv_terms(self) -> torch.Tensor | NDArray:
-        """Get PV work term for each system in batch (zeros for fixed cell)."""
-        energies = self.get_potential_energies()
-        if isinstance(energies, torch.Tensor):
-            return torch.zeros_like(energies)
-        if isinstance(energies, np.ndarray):
-            return np.zeros_like(energies)
-        return 0.0
-
-    def get_enthalpies(self) -> torch.Tensor | NDArray:
-        """Get enthalpy H = E + PV for each system in batch."""
-        return self.get_internal_energies() + self.get_pv_terms()
-
     def get_cells(self) -> torch.Tensor:
         """Get batch crystallographic cells."""
         return self.batch.cell
@@ -528,11 +534,40 @@ class OptimizableBatch(Optimizable):
     def get_volumes(self) -> torch.Tensor:
         """Get a tensor of volumes for each cell in batch"""
         cells = self.get_cells()
-        return torch.linalg.det(cells).abs()
+        return torch.linalg.det(cells)
 
     def iterimages(self) -> Generator[Batch, None, None]:
         # XXX document purpose of iterimages - this is just needed to work with ASE optimizers
         yield self.batch
+
+    def ndofs(self) -> int:
+        """Return the number of scalar degrees of freedom required by ASE."""
+        return 3 * len(self)
+
+    def get_x(self) -> np.ndarray:
+        """Return all optimization coordinates as a flat NumPy array."""
+        positions = self.get_positions()
+        if isinstance(positions, torch.Tensor):
+            positions = positions.detach().cpu().numpy()
+        return np.asarray(positions, dtype=float).reshape(-1)
+
+    def set_x(self, x: np.ndarray) -> None:
+        """Set optimization coordinates from ASE's flat array representation."""
+        self.set_positions(np.asarray(x, dtype=float).reshape(-1, 3))
+
+    def get_value(self) -> float:
+        """Return the current total objective value."""
+        energy = self.get_potential_energy()
+        if isinstance(energy, torch.Tensor):
+            energy = energy.detach().cpu().item()
+        return float(energy)
+
+    def get_gradient(self) -> np.ndarray:
+        """Return the negative forces as ASE's flat optimization gradient."""
+        forces = self.get_forces()
+        if isinstance(forces, torch.Tensor):
+            forces = forces.detach().cpu().numpy()
+        return -np.asarray(forces, dtype=float).reshape(-1)
 
     def get_max_forces(
         self, forces: torch.Tensor | None = None, apply_constraint: bool = False
@@ -565,73 +600,22 @@ class OptimizableBatch(Optimizable):
             )
             return result
 
-    def _format_observable(self, values: torch.Tensor) -> torch.Tensor | NDArray:
-        if self.numpy:
-            return values.detach().cpu().numpy()
-        return values
-
-    def get_max_atom_forces(
-        self,
-        forces: torch.Tensor | NDArray | None = None,
-        apply_constraint: bool = False,
-    ) -> torch.Tensor | NDArray:
-        """Get the maximum physical atomic force for each structure."""
-        if forces is None:
-            forces = self.get_property("forces", no_numpy=True)
-        elif isinstance(forces, np.ndarray):
-            forces = torch.as_tensor(forces, device=self.device, dtype=self.dtype)
-        else:
-            forces = forces.to(device=self.device, dtype=self.dtype)
-
-        forces = forces.reshape(-1, 3)
-        natoms = int(self.batch.num_nodes)
-        if forces.shape[0] < natoms:
-            raise ValueError(
-                f"Expected at least {natoms} force rows, got {forces.shape[0]}"
-            )
-        atom_forces = forces[:natoms]
-
-        if apply_constraint:
-            fixed = getattr(self.batch, "fixed", None)
-            if fixed is not None:
-                atom_forces = atom_forces.clone()
-                atom_forces[torch.where(fixed == 1)[0]] = 0.0
-
-        atom_norms = torch.linalg.vector_norm(atom_forces, dim=1)
-        result = torch.zeros(
-            len(self._slot_status), device=atom_norms.device, dtype=atom_norms.dtype
-        )
-        result.scatter_reduce_(
-            dim=0,
-            index=self.batch.batch,
-            src=atom_norms,
-            reduce="amax",
-            include_self=True,
-        )
-        return self._format_observable(result)
-
-    def _max_abs_stress(self, stress: torch.Tensor) -> torch.Tensor | NDArray:
-        stress = stress.reshape(stress.shape[0], -1)
-        return self._format_observable(stress.abs().amax(dim=1))
-
-    def get_max_stresses(self) -> torch.Tensor | NDArray | None:
-        """Get maximum model stress for fixed-cell calculations when available."""
-        if not self.compute_stress:
-            return None
-        try:
-            stress = self.get_property("stress", no_numpy=True).reshape(-1, 3, 3)
-        except PropertyNotImplementedError:
-            return None
-        return self._max_abs_stress(stress)
-
     def converged(
         self,
-        forces: torch.Tensor | NDArray | None = None,
-        fmax: float = 0.05,
+        forces: torch.Tensor | NDArray | None,
+        fmax: float,
         max_forces: torch.Tensor | None = None,
-        f_upper_limit: float = 100.0,
+        f_upper_limit: float = 1e20,
     ) -> bool:
-        """Check if all structures in batch are finished (converged or failed) using tensorized vectorization."""
+        """Check convergence for both ASE gradients and batchASE force tensors."""
+        if (
+            forces is not None
+            and max_forces is None
+            and getattr(forces, "ndim", None) == 1
+        ):
+            if isinstance(forces, torch.Tensor):
+                forces = forces.detach().cpu().numpy()
+            return super().converged(forces, fmax)
         if forces is not None:
             if isinstance(forces, np.ndarray):
                 forces = torch.tensor(
@@ -641,89 +625,24 @@ class OptimizableBatch(Optimizable):
         elif max_forces is None:
             max_forces = self.get_max_forces()
 
-        if max_forces.dim() == 0:
-            max_forces = max_forces.unsqueeze(0)
-
-        n_slots = len(self._slot_status)
-        dev = max_forces.device
-
-        # Track which slots are currently in terminal states
+        # Update mask is True for forces that are greater than fmax AND less than f_upper_limit
+        update_mask = torch.logical_and(
+            max_forces.ge(fmax), max_forces.le(f_upper_limit)
+        )
+        # update cached mask
         if self.mask_converged:
-            is_terminal = torch.tensor(
-                [s in (SlotStatus.CONVERGED, SlotStatus.FAILED) for s in self._slot_status],
-                device=dev,
-                dtype=torch.bool,
-            )
-        else:
-            is_terminal = torch.zeros(n_slots, device=dev, dtype=torch.bool)
-
-        # Vectorized cell validity check
-        has_cell_check = hasattr(self.batch, "cell") and self.batch.cell is not None
-        if has_cell_check:
-            cells = self.get_cells()
-            if cells.shape[0] == n_slots:
-                dets = torch.linalg.det(cells)
-                # invalid if nan, inf, or det <= 1e-6 (covers non-positive and inverted cells)
-                cell_invalid = torch.isnan(dets) | torch.isinf(dets) | (dets <= 1e-6)
+            if self._update_mask is None:
+                self._update_mask = update_mask
             else:
-                cell_invalid = torch.zeros(n_slots, device=dev, dtype=torch.bool)
-        else:
-            cell_invalid = torch.zeros(n_slots, device=dev, dtype=torch.bool)
+                # some models can have random noise in their predictions, so the mask is updated by
+                # keeping all previously converged structures masked even if new force predictions
+                # push it slightly above threshold
+                self._update_mask = torch.logical_and(
+                    self._update_mask, update_mask
+                )
+            update_mask = self._update_mask
 
-        # Slice forces to n_slots
-        mf = max_forces[:n_slots]
-        nan_f = torch.isnan(mf)
-        inf_f = torch.isinf(mf)
-        overflow_f = (mf > f_upper_limit) & (~nan_f) & (~inf_f)
-        conv_f = (mf < fmax) & (~nan_f) & (~inf_f)
-
-        # Only evaluate non-terminal slots
-        cell_invalid = cell_invalid & (~is_terminal)
-        nan_f = nan_f & (~is_terminal) & (~cell_invalid)
-        inf_f = inf_f & (~is_terminal) & (~cell_invalid)
-        overflow_f = overflow_f & (~is_terminal) & (~cell_invalid)
-        conv_f = conv_f & (~is_terminal) & (~cell_invalid)
-
-        # Vectorized active mask
-        new_active = (~is_terminal) & (~cell_invalid) & (~nan_f) & (~inf_f) & (~overflow_f) & (~conv_f)
-        self._update_mask = new_active
-
-        # If any slot changed to terminal state, sync status to host
-        any_new_failed = (cell_invalid | nan_f | inf_f | overflow_f).any().item()
-        any_new_conv = conv_f.any().item()
-
-        if any_new_failed or any_new_conv or (not self.mask_converged):
-            status_codes = torch.zeros(n_slots, dtype=torch.int8, device=dev)
-            status_codes[conv_f] = 1
-            status_codes[nan_f] = 2
-            status_codes[inf_f] = 3
-            status_codes[overflow_f] = 4
-            status_codes[cell_invalid] = 5
-
-            codes_list = status_codes.cpu().tolist()
-            for i, code in enumerate(codes_list):
-                if is_terminal[i].item():
-                    continue
-                if code == 1:
-                    self._slot_status[i] = SlotStatus.CONVERGED
-                    self._slot_reasons.pop(i, None)
-                elif code == 2:
-                    self._slot_status[i] = SlotStatus.FAILED
-                    self._slot_reasons[i] = FailReason.NAN_FORCE
-                elif code == 3:
-                    self._slot_status[i] = SlotStatus.FAILED
-                    self._slot_reasons[i] = FailReason.INF_FORCE
-                elif code == 4:
-                    self._slot_status[i] = SlotStatus.FAILED
-                    self._slot_reasons[i] = FailReason.FORCE_OVERFLOW
-                elif code == 5:
-                    self._slot_status[i] = SlotStatus.FAILED
-                    self._slot_reasons[i] = FailReason.INVALID_CELL
-                else:
-                    self._slot_status[i] = SlotStatus.ACTIVE
-                    self._slot_reasons.pop(i, None)
-
-        return not torch.any(self._update_mask).item()
+        return not torch.any(update_mask).item()
 
     def get_atoms_list(self) -> list[Atoms]:
         """Get ase Atoms objects corresponding to the batch"""
@@ -974,8 +893,9 @@ class OptimizableUnitCellBatch(OptimizableBatch):
             virial *= self.mask.view(-1, 3, 3)
 
         if self.constant_volume:
-            diagonal = virial.diagonal(dim1=-2, dim2=-1)
-            diagonal -= diagonal.sum(dim=-1, keepdim=True) / 3.0
+            virial[:, range(3), range(3)] -= (
+                self._batch_trace(virial).view(3, -1) / 3.0
+            )
 
         natoms = self.batch.num_nodes
         augmented_forces = torch.zeros(
@@ -1000,35 +920,12 @@ class OptimizableUnitCellBatch(OptimizableBatch):
     def __len__(self):
         return len(self.batch.pos) + 3 * len(self.batch)
 
-    def get_internal_energies(self) -> torch.Tensor:
-        """Get internal potential energy E for each system in batch (excluding PV term)."""
-        energies = self.get_property("energy")
-        if isinstance(energies, torch.Tensor):
-            return energies.reshape(-1)
-        if isinstance(energies, np.ndarray):
-            return energies.reshape(-1)
-        return energies
-
-    def get_pv_terms(self) -> torch.Tensor | NDArray:
-        """Get PV work term for each system in batch."""
-        pv_terms = self.pressure[0, 0] * self.get_volumes()
-        if self.numpy:
-            return pv_terms.detach().cpu().numpy()
-        return pv_terms
-
-    def get_enthalpies(self) -> torch.Tensor | NDArray:
-        """Get enthalpy H = E + PV for each system in batch."""
-        return self.get_internal_energies() + self.get_pv_terms()
-
-    def get_potential_energies(self) -> torch.Tensor | NDArray:
-        """Get the optimization objective (enthalpy when pressure != 0)."""
-        return self.get_enthalpies()
-
-    def get_max_stresses(self) -> torch.Tensor | NDArray:
-        """Get maximum effective residual stress for each structure."""
-        if self.stress is None:
-            self.get_forces(no_numpy=True)
-        return self._max_abs_stress(self.stress.reshape(-1, 3, 3))
+    def get_potential_energies(self) -> torch.Tensor:
+        """Get the predicted energy for each system in batch."""
+        return (
+            self.get_property("energy").view(-1)
+            + self.pressure[0, 0] * self.get_volumes()
+        )
 
 
 class OptimizableFrechetCellBatch(OptimizableBatch):
@@ -1330,8 +1227,8 @@ class OptimizableFrechetCellBatch(OptimizableBatch):
             deform_grad_log_force[batch_idx] = torch.from_numpy(deform_grad_log_force_batch).to(self.device)
 
         if self.constant_volume:
-            diagonal = deform_grad_log_force.diagonal(dim1=-2, dim2=-1)
-            diagonal -= diagonal.sum(dim=-1, keepdim=True) / 3.0
+            dglf_trace = self._batch_trace(deform_grad_log_force).view(-1, 1, 1)
+            deform_grad_log_force -= self._batch_diag(dglf_trace.squeeze() / 3.0)
 
         natoms = self.batch.num_nodes
         augmented_forces = torch.zeros(
@@ -1354,11 +1251,7 @@ class OptimizableFrechetCellBatch(OptimizableBatch):
         
         augmented_forces[natoms:] = cell_forces_scaled
 
-        effective_stress = -virial / volumes
-        if self.constant_volume:
-            diagonal = effective_stress.diagonal(dim1=-2, dim2=-1)
-            diagonal -= diagonal.sum(dim=-1, keepdim=True) / 3.0
-        self.stress = effective_stress.view(-1, 9)
+        self.stress = -virial.view(-1, 9) / volumes.view(-1, 1)
 
         if self.numpy and not no_numpy:
             augmented_forces = augmented_forces.cpu().numpy()
@@ -1368,32 +1261,9 @@ class OptimizableFrechetCellBatch(OptimizableBatch):
     def __len__(self):
         return len(self.batch.pos) + 3 * len(self.batch)
 
-    def get_internal_energies(self) -> torch.Tensor:
-        """Get internal potential energy E for each system in batch (excluding PV term)."""
-        energies = self.get_property("energy")
-        if isinstance(energies, torch.Tensor):
-            return energies.reshape(-1)
-        if isinstance(energies, np.ndarray):
-            return energies.reshape(-1)
-        return energies
-
-    def get_pv_terms(self) -> torch.Tensor | NDArray:
-        """Get PV work term for each system in batch."""
-        pv_terms = self.pressure[0, 0] * self.get_volumes()
-        if self.numpy:
-            return pv_terms.detach().cpu().numpy()
-        return pv_terms
-
-    def get_enthalpies(self) -> torch.Tensor | NDArray:
-        """Get enthalpy H = E + PV for each system in batch."""
-        return self.get_internal_energies() + self.get_pv_terms()
-
-    def get_potential_energies(self) -> torch.Tensor | NDArray:
-        """Get the optimization objective (enthalpy when pressure != 0)."""
-        return self.get_enthalpies()
-
-    def get_max_stresses(self) -> torch.Tensor | NDArray:
-        """Get maximum effective residual stress for each structure."""
-        if self.stress is None:
-            self.get_forces(no_numpy=True)
-        return self._max_abs_stress(self.stress.reshape(-1, 3, 3))
+    def get_potential_energies(self) -> torch.Tensor:
+        """Get the predicted energy for each system in batch."""
+        return (
+            self.get_property("energy").view(-1)
+            + self.pressure[0, 0] * self.get_volumes()
+        )

@@ -6,14 +6,25 @@ from .mace import MACEBatchBackend
 from .mock import MockBatchBackend
 from .sevennet import SevenNetBatchBackend
 from .chgnet import CHGNetBatchBackend
-from .matris import MatRISBatchBackend
+from .matris import DEFAULT_MATRIS_MODEL, MatRISBatchBackend
+from .eqv3 import DEFAULT_EQV3_MODEL, EqV3BatchBackend
 
 
-SUPPORTED_BACKENDS = ("mace", "mock")
-UNIMPLEMENTED_BACKENDS = ("sevennet", "chgnet", "matris", "matgl")
+SUPPORTED_BACKENDS = ("mace", "mock", "matris", "chgnet", "eqv3")
+UNIMPLEMENTED_BACKENDS = ("sevennet", "matgl")
 
-#: Cache directory convention of the MACE foundation-model loaders.
+#: Cache directory conventions of the foundation-model loaders.
 MACE_CACHE_DIR = Path.home() / ".cache" / "mace"
+MATRIS_CACHE_DIR = Path.home() / ".cache" / "matris"
+MATRIS_MODEL_NAMES = (
+    "matris_10m_omat",
+    "matris_10m_oam",
+    "matris_10m_mp",
+    "matris_4m_matpes_pbev1",
+    "matris_4m_matpes_pbev2",
+    "matris_4m_matpes_r2scanv1",
+    "matris_4m_matpes_r2scanv2",
+)
 
 #: MACE family aliases -> loader hint ("off" = MACE-OFF23, "mp" = MACE-MP).
 _MACE_FAMILY_LOADERS = {
@@ -75,6 +86,20 @@ def _is_known_mace_name(loader: str, spec: str) -> bool:
     return spec in urls
 
 
+def resolve_matris_checkpoint(
+    spec: str, cache_dir: Optional[Path] = None
+) -> Optional[Path]:
+    """Resolve a MatRIS checkpoint path or a filename in its model cache."""
+    if not spec:
+        return None
+    candidate = Path(spec).expanduser()
+    if candidate.is_file():
+        return candidate
+    base = Path(cache_dir) if cache_dir is not None else MATRIS_CACHE_DIR
+    cached = base / spec
+    return cached if cached.is_file() else None
+
+
 def validate_model_id(model_id: str) -> Optional[Path]:
     """Validate a model identifier without instantiating any backend.
 
@@ -83,9 +108,8 @@ def validate_model_id(model_id: str) -> Optional[Path]:
 
     Raises:
         ValueError: unknown family or malformed identifier.
-        NotImplementedError: placeholder family (sevennet/chgnet/matris/matgl).
-        FileNotFoundError: spec looks like a checkpoint file but was not found
-            as a local path, in the MACE cache, nor among built-in names.
+        NotImplementedError: placeholder family (sevennet/matgl).
+        FileNotFoundError: an eqV3 checkpoint cannot be resolved locally.
     """
     family, spec = parse_model_id(model_id)
     if family in UNIMPLEMENTED_BACKENDS:
@@ -93,12 +117,28 @@ def validate_model_id(model_id: str) -> Optional[Path]:
             f"Backend '{family}' is currently a placeholder/under active development "
             f"and not yet functional in batchASE. Currently supported backends: {list(SUPPORTED_BACKENDS)}"
         )
-    if family not in _MACE_FAMILY_LOADERS and family != "mock":
+    if family not in _MACE_FAMILY_LOADERS and family not in ("mock", "matris", "chgnet", "eqv3"):
         raise ValueError(
             f"Unknown potential backend: '{family}'. Supported: {list(SUPPORTED_BACKENDS)}"
         )
-    if family == "mock" or spec is None:
+    if family == "eqv3":
+        checkpoint = Path(spec or DEFAULT_EQV3_MODEL).expanduser()
+        if not checkpoint.is_file():
+            raise FileNotFoundError(f"eqV3 checkpoint was not found: '{checkpoint}'")
+        return checkpoint
+    if family in ("mock", "chgnet") or spec is None:
         return None
+    if family == "matris":
+        resolved = resolve_matris_checkpoint(spec)
+        if resolved is not None:
+            return resolved
+        if spec.lower() in MATRIS_MODEL_NAMES or spec.startswith(("http://", "https://")):
+            return None
+        raise FileNotFoundError(
+            f"MatRIS checkpoint '{spec}' was not found as a local path "
+            f"('{Path(spec).expanduser()}') nor in the MatRIS cache "
+            f"('{MATRIS_CACHE_DIR / spec}'), and it is not a built-in model name."
+        )
     resolved = resolve_checkpoint(spec)
     if resolved is not None:
         return resolved
@@ -123,6 +163,11 @@ def create_backend(model_id: str = "mace", **kwargs) -> BatchPotential:
     - ``mace_mp[:spec]``  MACE-MP family (89 elements incl. Li); ``spec`` is an
                           official name (e.g. ``medium-mpa-0``), a cached model
                           file name, or a local path (default: mace-mpa-0-medium)
+    - ``matris[:spec]``   MatRIS family; ``spec`` is an official model name, a
+                          cached filename in ``~/.cache/matris``, a local
+                          checkpoint path, or an HTTP(S) checkpoint URL
+    - ``chgnet[:spec]``   CHGNet family; ``spec`` is a released model name
+    - ``eqv3[:spec]``     eqV3 family; ``spec`` is a local FairChem checkpoint
     - ``mock``            Mock backend for tests
 
     Raises:
@@ -142,6 +187,28 @@ def create_backend(model_id: str = "mace", **kwargs) -> BatchPotential:
             # are used as-is.
             model_value = str(checkpoint) if checkpoint is not None else spec
         return MACEBatchBackend(model=model_value, loader=loader_hint, **kwargs)
+
+    if family == "matris":
+        model_value = kwargs.pop("model", None)
+        model_name = kwargs.pop("model_name", None)
+        if model_value is not None and model_name is not None:
+            raise ValueError("Pass only one of 'model' and 'model_name'.")
+        if model_value is None:
+            model_value = model_name
+        if model_value is None and spec is not None:
+            checkpoint = resolve_matris_checkpoint(spec)
+            model_value = str(checkpoint) if checkpoint is not None else spec
+        if model_value is None:
+            model_value = DEFAULT_MATRIS_MODEL
+        return MatRISBatchBackend(model=model_value, **kwargs)
+
+    if family == "chgnet":
+        model_name = kwargs.pop("model_name", spec or "0.3.0")
+        return CHGNetBatchBackend(model_name=model_name, **kwargs)
+
+    if family == "eqv3":
+        checkpoint = kwargs.pop("checkpoint_path", spec or DEFAULT_EQV3_MODEL)
+        return EqV3BatchBackend(checkpoint_path=checkpoint, **kwargs)
 
     if family == "mock":
         return MockBatchBackend(**kwargs)
@@ -163,11 +230,17 @@ __all__ = [
     "SevenNetBatchBackend",
     "CHGNetBatchBackend",
     "MatRISBatchBackend",
+    "EqV3BatchBackend",
     "SUPPORTED_BACKENDS",
     "UNIMPLEMENTED_BACKENDS",
     "MACE_CACHE_DIR",
+    "MATRIS_CACHE_DIR",
+    "MATRIS_MODEL_NAMES",
+    "DEFAULT_MATRIS_MODEL",
+    "DEFAULT_EQV3_MODEL",
     "parse_model_id",
     "resolve_checkpoint",
+    "resolve_matris_checkpoint",
     "validate_model_id",
     "create_backend",
 ]

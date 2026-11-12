@@ -76,11 +76,16 @@ class MACEBatchBackend:
         self.compile_mode = effective_compile_mode
         self.use_compile = effective_compile_mode is not None
 
-        # Process-level FastEq switch in cuequivariance_torch
+        # FastEq process switch exists only in older cuEquivariance releases.
         try:
             import cuequivariance_torch as cuet
-            cuet.set_fasteq_enabled(use_fasteq)
-            self.cuet_fasteq_active = cuet.fasteq_enabled()
+            if hasattr(cuet, "set_fasteq_enabled"):
+                cuet.set_fasteq_enabled(use_fasteq)
+                self.cuet_fasteq_active = cuet.fasteq_enabled()
+            else:
+                self.cuet_fasteq_active = False
+                if use_fasteq:
+                    logger.warning("FastEq is not supported by the installed cuEquivariance version")
         except ImportError:
             self.cuet_fasteq_active = False
 

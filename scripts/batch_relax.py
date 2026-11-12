@@ -64,8 +64,9 @@ def parse_args():
         help=(
             "Potential model identifier 'family[:spec]': mace (MACE-OFF23 small, legacy), "
             "mace_off[:small|medium|large|<file>], mace_mp[:<name|file>] (MACE-MP family, "
-            "89 elements incl. Li; default mace-mpa-0-medium), mock. 'spec' may be an "
-            "official model name, a file name under ~/.cache/mace, or a local path."
+            "89 elements incl. Li; default mace-mpa-0-medium), chgnet[:<name>], "
+            "eqv3[:<checkpoint>], matris[:<name|file>], mock. 'spec' may be an "
+            "official model name, a cached file name, or a local path."
         ),
     )
     parser.add_argument("--device", type=str, default=None, help="Execution device (for example 'cpu' or 'cuda:0'); overrides --n_gpus")
@@ -75,6 +76,7 @@ def parse_args():
     parser.add_argument("--num_threads", type=int, default=1, help="Number of CPU threads per process")
     parser.add_argument("--bind_cores", type=str, default=None, help="Core ranges for each worker")
     parser.add_argument("--compile_mode", type=str, default=None, help="torch.compile mode")
+    parser.add_argument("--neighbor", type=str, default="auto", choices=["auto", "cuda", "hip", "triton", "cpu"], help="PBC neighbor graph backend")
     parser.add_argument("--profile", type=str, default="False", help="Enable profiling options")
     parser.add_argument("--num_structures", type=int, default=0, help="Maximum structures to optimize (0 = all); structure_order controls selection and order")
     parser.add_argument("--run_baseline", type=str2bool, nargs="?", const=True, default=False, help="Run baseline sequential ASE")
@@ -182,6 +184,7 @@ def main():
         use_fasteq=args.use_fasteq,
         cueq=args.cueq,
         bfgs_cpu_thread=args.bfgs_cpu_thread,
+        neighbor=args.neighbor,
         max_batch_atoms=args.max_batch_atoms,
         batch_mode=args.batch_mode,
         structure_order=args.structure_order,

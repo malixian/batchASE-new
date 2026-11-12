@@ -137,6 +137,7 @@ class Scheduler:
         molecule_single: Optional[int] = None,
         bfgs_cpu_thread: int = 1,
         compile_mode: Optional[str] = None,
+        neighbor: str = "auto",
         batch_mode: str = "bsize",
         max_batch_atoms: int = 0,
         structure_order: str = "rand",
@@ -179,6 +180,7 @@ class Scheduler:
             self.molecule_single = parsed_molecule_single
         self.bfgs_cpu_thread = bfgs_cpu_thread
         self.compile_mode = compile_mode or kwargs.pop("compile_mode", None)
+        self.neighbor = neighbor
         self.batch_mode = batch_mode
         self.max_batch_atoms = int(max_batch_atoms)
         self.structure_order = structure_order
@@ -309,6 +311,7 @@ class Scheduler:
             "cueq": self.cueq,
             "bfgs_cpu_thread": self.bfgs_cpu_thread,
             "compile_mode": self.compile_mode,
+            "neighbor": self.neighbor,
             "use_profiler": self.use_profiler,
             "profiler_log_dir": self.profiler_log_dir,
             "profiler_schedule_config": self.profiler_schedule_config,
