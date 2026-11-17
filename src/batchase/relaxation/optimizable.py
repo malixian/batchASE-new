@@ -278,7 +278,7 @@ class OptimizableBatch(Optimizable):
     @property
     def converged_mask(self):
         if self._update_mask is not None:
-            return torch.logical_not(self._update_mask)
+            return self._converged_mask
         return None
 
     @property
@@ -289,7 +289,17 @@ class OptimizableBatch(Optimizable):
 
     @property
     def converge_indices_list(self):
-        return torch.where(~self.update_mask)[0].tolist()
+        mask = self.converged_mask
+        return [] if mask is None else torch.where(mask)[0].tolist()
+
+    @property
+    def failed_indices_list(self):
+        mask = getattr(self, "_failed_mask", None)
+        return [] if mask is None else torch.where(mask)[0].tolist()
+
+    @property
+    def failed_reasons(self):
+        return getattr(self, "_failed_reasons", {})
 
     @property
     def elem_per_group(self):
@@ -625,22 +635,29 @@ class OptimizableBatch(Optimizable):
         elif max_forces is None:
             max_forces = self.get_max_forces()
 
-        # Update mask is True for forces that are greater than fmax AND less than f_upper_limit
-        update_mask = torch.logical_and(
-            max_forces.ge(fmax), max_forces.le(f_upper_limit)
-        )
-        # update cached mask
-        if self.mask_converged:
-            if self._update_mask is None:
-                self._update_mask = update_mask
-            else:
-                # some models can have random noise in their predictions, so the mask is updated by
-                # keeping all previously converged structures masked even if new force predictions
-                # push it slightly above threshold
-                self._update_mask = torch.logical_and(
-                    self._update_mask, update_mask
-                )
-            update_mask = self._update_mask
+        # Stopped slots include both successful convergence and failure.
+        # Keep their states separate so high/non-finite forces cannot succeed.
+        finite = torch.isfinite(max_forces)
+        failure = ~finite | (max_forces > f_upper_limit)
+        success = finite & ~failure & (max_forces < fmax)
+        previous = self._update_mask
+        if previous is None or not self.mask_converged:
+            self._converged_mask = success.clone()
+            self._failed_mask = failure.clone()
+            self._failed_reasons = {}
+            newly_failed = failure
+        else:
+            self._converged_mask |= success & previous
+            self._failed_mask |= failure & previous
+            newly_failed = failure & previous
+        for index in torch.where(newly_failed)[0].tolist():
+            value = max_forces[index]
+            self._failed_reasons[index] = (
+                "nan_force" if torch.isnan(value).item() else
+                "inf_force" if torch.isinf(value).item() else "force_overflow"
+            )
+        update_mask = ~(self._converged_mask | self._failed_mask)
+        self._update_mask = update_mask
 
         return not torch.any(update_mask).item()
 
