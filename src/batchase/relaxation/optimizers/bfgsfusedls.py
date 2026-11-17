@@ -38,7 +38,7 @@ class BFGSFusedLS:
         profiler_log_dir: str = './log',
         profiler_schedule_config: dict = None,
         dtype: torch.dtype = torch.float64,
-        f_upper_limit: float = 100.0,
+        f_upper_limit: float = float("inf"),
     ):
         self.optimizable = optimizable_batch
         self.maxstep = maxstep

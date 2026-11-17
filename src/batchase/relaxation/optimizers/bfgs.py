@@ -67,7 +67,7 @@ class _BFGSGpu(BFGS):
         maxstep: float = 0.2,
         alpha: float = 70.0,
         early_stop: bool = False,
-        f_upper_limit: float = 100.0,
+        f_upper_limit: float = float("inf"),
         **kwargs,
     ) -> None:
         super(BFGS, self).__init__(optimizable=optimizable_batch, maxstep=maxstep)
@@ -498,7 +498,7 @@ class _BFGSCpu(BFGS):
         alpha: float = 70.0,
         early_stop: bool = False,
         bfgs_cpu_thread: int = 16,
-        f_upper_limit: float = 100.0,
+        f_upper_limit: float = float("inf"),
         **kwargs,
     ) -> None:
         super(BFGS, self).__init__(optimizable=optimizable_batch, maxstep=maxstep)

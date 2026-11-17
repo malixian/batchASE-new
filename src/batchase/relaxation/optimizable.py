@@ -615,7 +615,7 @@ class OptimizableBatch(Optimizable):
         forces: torch.Tensor | NDArray | None,
         fmax: float,
         max_forces: torch.Tensor | None = None,
-        f_upper_limit: float = 1e20,
+        f_upper_limit: float = float("inf"),
     ) -> bool:
         """Check convergence for both ASE gradients and batchASE force tensors."""
         if (

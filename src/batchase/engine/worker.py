@@ -117,7 +117,7 @@ class Worker:
         self.bfgs_cpu_thread = bfgs_cpu_thread
         self.compile_mode = compile_mode or kwargs.get("compile_mode", None)
         self.neighbor = neighbor
-        self.f_upper_limit = float(kwargs.get("f_upper_limit", 100.0))
+        self.f_upper_limit = float(kwargs.get("f_upper_limit", float("inf")))
         self.stage2_include_unconverged = bool(kwargs.get("stage2_include_unconverged", False))
         self.use_profiler = kwargs.get("use_profiler", False)
         self.profiler_log_dir = kwargs.get("profiler_log_dir", None)

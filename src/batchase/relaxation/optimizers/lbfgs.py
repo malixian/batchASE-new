@@ -33,7 +33,7 @@ class LBFGS:
         traj_dir: Path | None = None,
         traj_names: list[str] | None = None,
         early_stop: bool = False,
-        f_upper_limit: float = 100.0,
+        f_upper_limit: float = float("inf"),
     ) -> None:
         """
         Args:

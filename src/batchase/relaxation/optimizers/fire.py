@@ -79,7 +79,7 @@ class _BatchFIREBase(BatchOptimizer):
         flavor: str = "fire",
         force_reeval: bool = True,
         early_stop: bool = False,
-        f_upper_limit: float = 100.0,
+        f_upper_limit: float = float("inf"),
         **kwargs,
     ) -> None:
         super().__init__(optimizable=optimizable, maxstep=maxstep)
